@@ -1,0 +1,1309 @@
+// config.go
+package config
+
+import (
+    "log"
+    "os"
+
+    "github.com/joho/godotenv"
+)
+
+var (
+    SupabaseURL string
+    SupabaseKey string
+    JWTSecret   string
+)
+
+func LoadEnv() {
+    err := godotenv.Load()
+    if err != nil {
+        log.Println("Warning: .env file not found, using environment variables")
+    }
+
+    SupabaseURL = os.Getenv("SUPABASE_URL")
+    SupabaseKey = os.Getenv("SUPABASE_KEY")
+    JWTSecret = os.Getenv("JWT_SECRET")
+
+    if SupabaseURL == "" || SupabaseKey == "" {
+        log.Fatal("❌ SUPABASE_URL and SUPABASE_KEY must be set")
+    }
+}
+
+
+// db.go 
+// db/db.go
+package db
+
+import (
+    "kaspi-bot/config"
+    "kaspi-bot/models"
+    "fmt"
+    "log"
+
+    "github.com/nedpals/supabase-go"
+)
+
+var Client *supabase.Client
+
+func Init() {
+    Client = supabase.CreateClient(config.SupabaseURL, config.SupabaseKey)
+    log.Println("✅ Database initialized")
+}
+
+// Shop operations with proper user_id handling
+func SaveShop(shop models.Shop, userID string) error {
+    // Ensure the shop has the correct user_id
+    shop.UserID = userID
+    
+    var result interface{}
+    err := Client.DB.From("kaspi_shops").Insert(shop).Execute(&result)
+    return err
+}
+
+func GetLatestShop(userID string) (models.Shop, error) {
+    var shops []models.Shop
+    
+    err := Client.DB.
+    From("kaspi_shops").
+    Select("*", "order=created_at.desc", "limit=1").
+    Eq("user_id", userID).
+    Execute(&shops)
+
+    if err != nil {
+        return models.Shop{}, err
+    }
+    
+    if len(shops) == 0 {
+        return models.Shop{}, fmt.Errorf("no shop credentials found for this user")
+    }
+    
+    return shops[0], nil
+}
+
+// Product operations with proper user_id handling
+func SaveProducts(products []models.Product, userID string) error {
+    if len(products) == 0 {
+        return nil
+    }
+    
+    // CRITICAL: Only delete THIS user's products, not all products!
+    // This prevents deleting other users' data
+    var deleteResult interface{}
+    err := Client.DB.From("products").
+        Delete().
+        Eq("user_id", userID). // Only delete current user's products
+        Execute(&deleteResult)
+    
+    if err != nil {
+        log.Printf("Warning: failed to clear existing products for user %s: %v", userID, err)
+    }
+    
+    // Set user_id for all products and insert them
+    for _, product := range products {
+        product.UserID = userID // Ensure each product has the correct user_id
+        
+        var result interface{}
+        err := Client.DB.From("products").Insert(product).Execute(&result)
+        if err != nil {
+            log.Printf("Failed to save product %s for user %s: %v", product.Name, userID, err)
+            continue
+        }
+    }
+    
+    return nil
+}
+
+func GetAllProducts(userID string) ([]models.Product, error) {
+    var products []models.Product
+    err := Client.DB.From("products").
+        Select("*").
+        Eq("user_id", userID). // Only get this user's products
+        Execute(&products)
+    return products, err
+}
+
+func UpdateProductPrice(id string, price float64, userID string) error {
+    update := map[string]interface{}{
+        "price": price,
+    }
+    var result interface{}
+    
+    // CRITICAL: Include user_id in the WHERE clause to prevent 
+    // users from updating other users' products
+    err := Client.DB.From("products").
+        Update(update).
+        Eq("id", id).
+        Eq("user_id", userID). // Security: only update if it belongs to this user
+        Execute(&result)
+    return err
+}
+
+// Helper functions for backward compatibility (remove these after migration)
+// These are the OLD functions without user isolation - DANGEROUS!
+func SaveShop2(shop models.Shop) error {
+    log.Println("⚠️ WARNING: Using deprecated SaveShop2 without user isolation!")
+    var result interface{}
+    return Client.DB.From("kaspi_shops").Insert(shop).Execute(&result)
+}
+
+func GetLatestShop2() (models.Shop, error) {
+    log.Println("⚠️ WARNING: Using deprecated GetLatestShop2 without user isolation!")
+    var shops []models.Shop
+    
+    err := Client.DB.
+        From("kaspi_shops").
+        Select("*").
+        Limit(1).
+        Execute(&shops)
+    
+    if err != nil {
+        return models.Shop{}, err
+    }
+    
+    if len(shops) == 0 {
+        return models.Shop{}, fmt.Errorf("no shop credentials found")
+    }
+    
+    return shops[0], nil
+}
+
+func SaveProducts2(products []models.Product) error {
+    log.Println("⚠️ WARNING: Using deprecated SaveProducts2 - THIS DELETES ALL USERS' PRODUCTS!")
+    if len(products) == 0 {
+        return nil
+    }
+    
+    // THIS IS DANGEROUS - it deletes ALL products from ALL users!
+    var deleteResult interface{}
+    err := Client.DB.From("products").Delete().Neq("price", "0").Execute(&deleteResult)
+    
+    if err != nil {
+        log.Printf("Warning: failed to clear existing products: %v", err)
+    }
+    
+    // Insert new products
+    for _, product := range products {
+        var result interface{}
+        err := Client.DB.From("products").Insert(product).Execute(&result)
+        if err != nil {
+            log.Printf("Failed to save product %s: %v", product.Name, err)
+            continue
+        }
+    }
+    
+    return nil
+}
+
+func GetAllProducts2() ([]models.Product, error) {
+    log.Println("⚠️ WARNING: Using deprecated GetAllProducts2 without user isolation!")
+    var products []models.Product
+    err := Client.DB.From("products").Select("*").Execute(&products)
+    return products, err
+}
+
+func UpdateProductPrice2(id string, price float64) error {
+    log.Println("⚠️ WARNING: Using deprecated UpdateProductPrice2 without user isolation!")
+    update := map[string]interface{}{
+        "price": price,
+    }
+    var result interface{}
+    err := Client.DB.From("products").Update(update).Eq("id", id).Execute(&result)
+    return err
+}
+
+//handlers.go
+package handlers
+
+import (
+    "kaspi-bot/db"
+    "kaspi-bot/middleware"
+    "kaspi-bot/models"
+    "kaspi-bot/scraper"
+    "kaspi-bot/services"
+    "encoding/json"
+    "log"
+    "net/http"
+
+    "github.com/nedpals/supabase-go"
+)
+
+// Response helpers
+func sendJSON(w http.ResponseWriter, data interface{}) {
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(data)
+}
+
+func sendError(w http.ResponseWriter, message string, code int) {
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(code)
+    json.NewEncoder(w).Encode(map[string]string{"error": message})
+}
+
+func sendSuccess(w http.ResponseWriter, message string) {
+    sendJSON(w, map[string]string{"status": "success", "message": message})
+}
+
+// Auth handlers
+func RegisterHandler(w http.ResponseWriter, r *http.Request) {
+    var user models.User
+    if err := json.NewDecoder(r.Body).Decode(&user); err != nil {
+        sendError(w, "Invalid input", http.StatusBadRequest)
+        return
+    }
+
+    userResponse, err := db.Client.Auth.SignUp(r.Context(), supabase.UserCredentials{
+        Email:    user.Email,
+        Password: user.Password,
+    })
+
+    if err != nil {
+        sendError(w, "Registration failed: "+err.Error(), http.StatusBadRequest)
+        return
+    }
+
+    sendJSON(w, userResponse)
+}
+
+func LoginHandler(w http.ResponseWriter, r *http.Request) {
+    var user models.User
+    if err := json.NewDecoder(r.Body).Decode(&user); err != nil {
+        sendError(w, "Invalid input", http.StatusBadRequest)
+        return
+    }
+
+    userSession, err := db.Client.Auth.SignIn(r.Context(), supabase.UserCredentials{
+        Email:    user.Email,
+        Password: user.Password,
+    })
+
+    if err != nil {
+        sendError(w, "Login failed: "+err.Error(), http.StatusUnauthorized)
+        return
+    }
+
+    // Generate JWT token
+    jwtToken, err := middleware.GenerateJWT(userSession.User.ID, userSession.User.Email)
+    if err != nil {
+        sendError(w, "Failed to generate token: "+err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    // Return both Supabase session and JWT token
+    response := map[string]interface{}{
+        "user":         userSession.User,
+        "access_token": userSession.AccessToken,
+        "jwt_token":    jwtToken, // Your custom JWT for API authentication
+    }
+
+    sendJSON(w, response)
+}
+
+// Shop handlers (protected routes)
+func SaveShopHandler(w http.ResponseWriter, r *http.Request) {
+    userID, ok := middleware.GetUserIDFromContext(r)
+    if !ok {
+        sendError(w, "User not authenticated", http.StatusUnauthorized)
+        return
+    }
+
+    var shop models.Shop
+    if err := json.NewDecoder(r.Body).Decode(&shop); err != nil {
+        sendError(w, "Invalid input", http.StatusBadRequest)
+        return
+    }
+
+    if err := db.SaveShop(shop, userID); err != nil {
+        sendError(w, "Failed to save shop: "+err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    sendSuccess(w, "Shop credentials saved successfully")
+}
+
+// Product handlers (protected routes)
+func ScrapeProductsHandler(w http.ResponseWriter, r *http.Request) {
+    userID, ok := middleware.GetUserIDFromContext(r)
+    if !ok {
+        sendError(w, "User not authenticated", http.StatusUnauthorized)
+        return
+    }
+
+    shop, err := db.GetLatestShop(userID)
+    if err != nil {
+        sendError(w, "Shop credentials not found", http.StatusBadRequest)
+        return
+    }
+
+    log.Println("🚀 Starting product scraping for user:", userID)
+    products, err := scraper.ScrapeKaspiProducts(shop.Login, shop.Password)
+    if err != nil {
+        sendError(w, "Failed to scrape products: "+err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    if err := db.SaveProducts(products, userID); err != nil {
+        sendError(w, "Failed to save products: "+err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    log.Printf("✅ Successfully scraped and saved %d products for user %s", len(products), userID)
+    sendJSON(w, map[string]interface{}{
+        "status":   "success",
+        "message":  "Products scraped successfully",
+        "count":    len(products),
+        "products": products,
+    })
+}
+
+func GetProductsHandler(w http.ResponseWriter, r *http.Request) {
+    userID, ok := middleware.GetUserIDFromContext(r)
+    if !ok {
+        sendError(w, "User not authenticated", http.StatusUnauthorized)
+        return
+    }
+
+    products, err := db.GetAllProducts(userID)
+    if err != nil {
+        sendError(w, "Failed to get products: "+err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    sendJSON(w, products)
+}
+
+// Price handlers
+type CompetitorRequest struct {
+    ProductName string `json:"product_name"`
+    ProductURL  string `json:"product_url"`
+}
+
+func GetCompetitorPricesHandler(w http.ResponseWriter, r *http.Request) {
+    // This endpoint might not need user authentication if it's just getting market data
+    var req CompetitorRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        sendError(w, "Invalid input", http.StatusBadRequest)
+        return
+    }
+
+    if req.ProductName == "" {
+        sendError(w, "Product name is required", http.StatusBadRequest)
+        return
+    }
+
+    price, err := scraper.GetLowestCompetitorPrice(req.ProductName)
+    if err != nil {
+        sendError(w, "Failed to get competitor prices: "+err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    sendJSON(w, map[string]interface{}{
+        "product_name":     req.ProductName,
+        "lowest_price":     price,
+        "competitor_count": 1,
+    })
+}
+
+// Damping handlers (protected routes)
+func StartDampingHandler(w http.ResponseWriter, r *http.Request) {
+    userID, ok := middleware.GetUserIDFromContext(r)
+    if !ok {
+        sendError(w, "User not authenticated", http.StatusUnauthorized)
+        return
+    }
+
+    if err := services.StartDamping(userID); err != nil {
+        sendError(w, err.Error(), http.StatusConflict)
+        return
+    }
+
+    sendSuccess(w, "Damping process started in background")
+}
+
+func GetDampingStatusHandler(w http.ResponseWriter, r *http.Request) {
+    userID, ok := middleware.GetUserIDFromContext(r)
+    if !ok {
+        sendError(w, "User not authenticated", http.StatusUnauthorized)
+        return
+    }
+
+    status := services.GetDampingStatus(userID)
+    sendJSON(w, status)
+}
+
+//kaspi/price_updater.go
+package kaspi
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "strconv"
+    "time"
+    "strings"
+
+    "github.com/chromedp/chromedp"
+)
+
+func UpdateProductPriceOnKaspi(login, password, name string, price float64) error {
+    
+    allocOpts := append(chromedp.DefaultExecAllocatorOptions[:],
+        chromedp.Flag("headless", true),
+        chromedp.Flag("no-sandbox", true),
+        chromedp.Flag("disable-gpu", true),
+        chromedp.Flag("disable-dev-shm-usage", true),
+        chromedp.Flag("disable-setuid-sandbox", true),
+        chromedp.Flag("disable-extensions", true),
+        chromedp.Flag("disable-background-networking", true),
+        chromedp.Flag("disable-sync", true),
+        chromedp.Flag("disable-translate", true),
+        chromedp.Flag("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"),
+    )
+    allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), allocOpts...)
+    defer allocCancel()
+
+    // create browser context
+    ctx, ctxCancel := chromedp.NewContext(allocCtx)
+    defer ctxCancel()
+    priceStr := strconv.FormatFloat(price, 'f', 0, 64)
+
+    // add overall timeout (increase if you need more time)
+    ctx, timeoutCancel := context.WithTimeout(ctx, 2*time.Minute)
+    defer timeoutCancel()
+
+    log.Println("🔄 Starting Kaspi product scraping...")
+
+    // --- Try login with retries
+    var loginErr error
+    for i := 0; i < 3; i++ {
+        loginErr = chromedp.Run(ctx,
+            chromedp.Navigate("https://idmc.shop.kaspi.kz"),
+            chromedp.WaitVisible(`body`, chromedp.ByQuery),
+            chromedp.WaitVisible(`#user_email_field`, chromedp.ByID),
+            chromedp.SendKeys(`#user_email_field`, login, chromedp.ByID),
+            chromedp.WaitVisible(`.button.is-primary`, chromedp.ByQuery),
+            chromedp.Click(`.button.is-primary`, chromedp.ByQuery),
+            chromedp.Sleep(2*time.Second),
+            chromedp.WaitVisible(`#password_field`, chromedp.ByID),
+            chromedp.SendKeys(`#password_field`, password, chromedp.ByID),
+            chromedp.WaitVisible(`.button.is-primary`, chromedp.ByQuery),
+            chromedp.Click(`.button.is-primary`, chromedp.ByQuery),
+            chromedp.Sleep(3*time.Second),
+        )
+        if loginErr == nil {
+            break
+        }
+        log.Printf("Login attempt %d failed: %v", i+1, loginErr)
+        time.Sleep(2 * time.Second)
+    }
+    if loginErr != nil {
+        return fmt.Errorf("login failed: %w", loginErr)
+    }
+
+    // 2. Баға өзгерту логикасы (changePrice үлгісімен)
+    encodedName := strings.ReplaceAll(name, " ", "%20")
+    encodedName = strings.ReplaceAll(encodedName, "\"", "%22")
+    encodedName = strings.ReplaceAll(encodedName, "#", "%23")
+    encodedName = strings.ReplaceAll(encodedName, "&", "%26")
+    encodedName = strings.ReplaceAll(encodedName, "=", "%3D")
+    encodedName = strings.ReplaceAll(encodedName, "/", "%2F")
+
+    url := fmt.Sprintf("https://kaspi.kz/mc/#/products/active/1?text=%s", encodedName)
+
+    log.Printf("Changing price for: %s to %s", name, priceStr)
+
+    err := chromedp.Run(ctx,
+        chromedp.Navigate("https://kaspi.kz/mc/#/products/active/1"),
+        chromedp.Sleep(8*time.Second),
+        chromedp.Navigate(url),
+        chromedp.Sleep(5*time.Second),
+
+        chromedp.Click(`img.dropdown__icon`, chromedp.ByQuery),
+        chromedp.Sleep(3*time.Second),
+        chromedp.Click(`a[data-v-12b625cc]:first-child`, chromedp.ByQuery),
+        chromedp.Sleep(2*time.Second),
+
+        chromedp.Evaluate(`
+            (function() {
+                const input = document.querySelector('input.input.mb-1');
+                if (input) {
+                    input.value = '`+priceStr+`';
+                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                    input.dispatchEvent(new Event('change', { bubbles: true }));
+                    return true;
+                }
+                return false;
+            })()
+        `, nil),
+
+        chromedp.Sleep(1*time.Second),
+
+        chromedp.Evaluate(`
+            (function() {
+                const elements = document.querySelectorAll('span');
+                for (let el of elements) {
+                    if (el.textContent.trim() === "Сохранить изменения") {
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+            })()
+        `, nil),
+
+        chromedp.Sleep(3*time.Second),
+    )
+    if err != nil {
+        return fmt.Errorf("failed to change price: %v", err)
+    }
+
+    log.Printf("✅ Price changed successfully for: %s", name)
+    return nil
+}
+
+// middleware/auth.go
+package middleware
+
+import (
+    "context"
+    "net/http"
+    "strings"
+    "time"
+
+    "kaspi-bot/config"
+    "encoding/json"
+    "github.com/golang-jwt/jwt/v5"
+)
+
+
+type contextKey string
+
+const UserContextKey contextKey = "user_id"
+
+// JWTMiddleware validates JWT tokens and extracts user_id
+func JWTMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        // Get token from Authorization header
+        authHeader := r.Header.Get("Authorization")
+        if authHeader == "" {
+            sendError(w, "Authorization header required", http.StatusUnauthorized)
+            return
+        }
+
+        // Extract token from "Bearer <token>"
+        parts := strings.Split(authHeader, " ")
+        if len(parts) != 2 || parts[0] != "Bearer" {
+            sendError(w, "Invalid authorization header format", http.StatusUnauthorized)
+            return
+        }
+
+        tokenString := parts[1]
+
+        // Parse and validate token
+        token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
+            return []byte(config.JWTSecret), nil
+        })
+
+        if err != nil {
+            sendError(w, "Invalid token: "+err.Error(), http.StatusUnauthorized)
+            return
+        }
+
+        claims, ok := token.Claims.(*Claims)
+        if !ok || !token.Valid {
+            sendError(w, "Invalid token claims", http.StatusUnauthorized)
+            return
+        }
+
+        // Check if token is expired
+        if claims.ExpiresAt != nil && claims.ExpiresAt.Time.Before(time.Now()) {
+            sendError(w, "Token expired", http.StatusUnauthorized)
+            return
+        }
+
+        // Add user_id to request context
+        ctx := context.WithValue(r.Context(), UserContextKey, claims.UserID)
+        next.ServeHTTP(w, r.WithContext(ctx))
+    })
+}
+
+// GetUserIDFromContext extracts user_id from request context
+func GetUserIDFromContext(r *http.Request) (string, bool) {
+    userID, ok := r.Context().Value(UserContextKey).(string)
+    return userID, ok
+}
+
+// sendError helper function
+func sendError(w http.ResponseWriter, message string, code int) {
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(code)
+    json.NewEncoder(w).Encode(map[string]string{"error": message})
+}
+
+// middleware/jwt.go
+package middleware
+
+import (
+    "time"
+    "kaspi-bot/config"
+    "github.com/golang-jwt/jwt/v5"
+)
+
+type Claims struct {
+    UserID string `json:"user_id"`
+    Email  string `json:"email"`
+    jwt.RegisteredClaims
+}
+
+// GenerateJWT creates a new JWT token for the user
+func GenerateJWT(userID, email string) (string, error) {
+    claims := Claims{
+        UserID: userID,
+        Email:  email,
+        RegisteredClaims: jwt.RegisteredClaims{
+            ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)), // 24 hours
+            IssuedAt:  jwt.NewNumericDate(time.Now()),
+            NotBefore: jwt.NewNumericDate(time.Now()),
+        },
+    }
+
+    token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+    tokenString, err := token.SignedString([]byte(config.JWTSecret))
+    if err != nil {
+        return "", err
+    }
+
+    return tokenString, nil
+}
+//scraper/kaspi.go
+
+package scraper
+
+import (
+    "kaspi-bot/models"
+    "context"
+    "fmt"
+    "log"
+    "net/url"
+    "strconv"
+    "strings"
+    "time"
+
+    "github.com/chromedp/cdproto/cdp"
+    "github.com/chromedp/chromedp"
+)
+
+func ScrapeKaspiProducts2(login, password string) ([]models.Product, error) {
+	opts, cancel := chromedp.NewExecAllocator(context.Background(),
+		chromedp.Flag("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"),
+        chromedp.Flag("headless", true),
+        chromedp.Flag("no-sandbox", true),
+        chromedp.Flag("disable-gpu", true),
+        chromedp.Flag("disable-dev-shm-usage", true),
+        chromedp.Flag("disable-setuid-sandbox", true),
+        chromedp.Flag("disable-extensions", true),
+        chromedp.Flag("disable-background-networking", true),
+        chromedp.Flag("disable-sync", true),
+        chromedp.Flag("disable-translate", true),
+        )
+	defer cancel()
+	allocCtx, cancel := chromedp.NewContext(opts)
+	defer cancel()
+	ctx, cancelTimeout := context.WithTimeout(allocCtx, 120*time.Second)
+	defer cancelTimeout()
+
+
+    log.Println("🔄 Starting Kaspi product scraping...")
+
+    var products []models.Product
+    var success bool
+    // Login first
+    err := chromedp.Run(ctx,
+        chromedp.Navigate("https://idmc.shop.kaspi.kz"),
+		chromedp.WaitVisible(`#user_email_field`, chromedp.ByID),
+		chromedp.SendKeys(`#user_email_field`, login, chromedp.ByID),
+		chromedp.Click(`.button.is-primary`, chromedp.ByQuery),
+		chromedp.Sleep(3*time.Second),
+		chromedp.WaitVisible(`#password_field`, chromedp.ByID),
+		chromedp.SendKeys(`#password_field`, password, chromedp.ByID),
+		chromedp.Click(`.button.is-primary`, chromedp.ByQuery),
+		chromedp.Sleep(2*time.Second),
+		chromedp.Evaluate(`document.querySelector('body') !== null`, &success),
+		chromedp.Navigate("https://kaspi.kz/mc/#/products/active/1"),
+    )
+    
+    if err != nil || !success {
+        return nil, fmt.Errorf("login failed: %w", err)
+    }
+
+    // Navigate to products page
+    err = chromedp.Run(ctx,
+        chromedp.Navigate("https://kaspi.kz/mc/#/products/active/1"),
+        chromedp.Sleep(3*time.Second),
+    )
+    
+    if err != nil {
+        return nil, fmt.Errorf("failed to navigate to products: %w", err)
+    }
+
+    // Scrape products from multiple pages
+    page := 1
+    for page <= 5 { // Limit to 5 pages to avoid infinite loops
+        log.Printf("📄 Scraping page %d", page)
+        
+        var names, prices, images []string
+        
+        err := chromedp.Run(ctx,
+        	chromedp.Sleep(5*time.Second),
+			chromedp.Evaluate(`Array.from(document.querySelectorAll('a.link-placeholder-class')).map(el => el.innerText)`, &names),
+			chromedp.Evaluate(`Array.from(document.querySelectorAll('td[data-label="Цена, тенге"]')).map(el => el.innerText)`, &prices),
+			chromedp.Evaluate(`Array.from(document.querySelectorAll('img.thumbnail')).map(el => el.src)`, &images),
+        )
+        
+        if err != nil || len(names) == 0 {
+            log.Printf("No more products found on page %d", page)
+            break
+        }
+
+        // Process scraped data
+        for i := 0; i < len(names) && i < len(prices); i++ {
+            price := parsePrice(prices[i])
+            imageURL := ""
+            if i < len(images) {
+                imageURL = images[i]
+            }
+            
+            product := models.Product{
+                Name:     strings.TrimSpace(names[i]),
+                Price:    price,
+                MinPrice: price, // 
+                MaxPrice: price, // 
+                Image:    imageURL,
+            }
+            
+            products = append(products, product)
+        }
+
+        // Try to go to next page
+        var hasNextPage bool
+        err = chromedp.Run(ctx,
+            chromedp.Evaluate(`
+                document.querySelector('.pagination .next, .page-next, [aria-label="Next"]') !== null
+            `, &hasNextPage),
+        )
+        
+        if err != nil || !hasNextPage {
+            break
+        }
+        
+        err = chromedp.Run(ctx,
+            chromedp.Click(`.pagination .next, .page-next, [aria-label="Next"]`, chromedp.ByQuery),
+            chromedp.Sleep(3*time.Second),
+        )
+        
+        if err != nil {
+            break
+        }
+        
+        page++
+    }
+
+    log.Printf("✅ Scraped %d products from Kaspi", len(products))
+    return products, nil
+}
+
+func ScrapeKaspiProducts(login, password string) ([]models.Product, error) {
+    // --- create allocator with user-agent and flags
+    allocOpts := append(chromedp.DefaultExecAllocatorOptions[:],
+        chromedp.Flag("headless", true),
+        chromedp.Flag("no-sandbox", true),
+        chromedp.Flag("disable-gpu", true),
+        chromedp.Flag("disable-dev-shm-usage", true),
+        chromedp.Flag("disable-setuid-sandbox", true),
+        chromedp.Flag("disable-extensions", true),
+        chromedp.Flag("disable-background-networking", true),
+        chromedp.Flag("disable-sync", true),
+        chromedp.Flag("disable-translate", true),
+        chromedp.Flag("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"),
+    )
+    allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), allocOpts...)
+    defer allocCancel()
+
+    // create browser context
+    ctx, ctxCancel := chromedp.NewContext(allocCtx)
+    defer ctxCancel()
+
+    // add overall timeout (increase if you need more time)
+    ctx, timeoutCancel := context.WithTimeout(ctx, 1*time.Minute)
+    defer timeoutCancel()
+
+    log.Println("🔄 Starting Kaspi product scraping...")
+
+    // --- Try login with retries
+    var loginErr error
+    for i := 0; i < 3; i++ {
+        loginErr = chromedp.Run(ctx,
+            chromedp.Navigate("https://idmc.shop.kaspi.kz"),
+            chromedp.WaitVisible(`body`, chromedp.ByQuery),
+            chromedp.WaitVisible(`#user_email_field`, chromedp.ByID),
+            chromedp.SendKeys(`#user_email_field`, login, chromedp.ByID),
+            chromedp.WaitVisible(`.button.is-primary`, chromedp.ByQuery),
+            chromedp.Click(`.button.is-primary`, chromedp.ByQuery),
+            chromedp.Sleep(2*time.Second),
+            chromedp.WaitVisible(`#password_field`, chromedp.ByID),
+            chromedp.SendKeys(`#password_field`, password, chromedp.ByID),
+            chromedp.WaitVisible(`.button.is-primary`, chromedp.ByQuery),
+            chromedp.Click(`.button.is-primary`, chromedp.ByQuery),
+            chromedp.Sleep(3*time.Second),
+        )
+        if loginErr == nil {
+            break
+        }
+        log.Printf("Login attempt %d failed: %v", i+1, loginErr)
+        time.Sleep(2 * time.Second)
+    }
+    if loginErr != nil {
+        return nil, fmt.Errorf("login failed: %w", loginErr)
+    }
+
+    // --- navigate to products page and wait some element that indicates page is ready
+    if err := chromedp.Run(ctx,
+        chromedp.Sleep(2*time.Second),
+        chromedp.Navigate("https://kaspi.kz/mc/#/products/active/1"),
+        // Wait for either product link selector or a table container — choose the best existing selector for your UI
+        chromedp.Sleep(2*time.Second),
+        chromedp.Navigate("https://kaspi.kz/mc/#/products/active/1"),
+        chromedp.WaitVisible(`a.link-placeholder-class, .products-table, .product-list`, chromedp.ByQuery),
+        chromedp.Sleep(2*time.Second),
+    ); err != nil {
+        // don't fail hard here — log and continue; sometimes SPA navigation is slow
+        log.Printf("warn: navigate to products page: %v", err)
+    }
+
+    var products []models.Product
+
+    // --- scrape up to N pages
+    for page := 1; page <= 10; page++ {
+        log.Printf("📄 Scraping page %d", page)
+
+        var names, prices, images []string
+        evalErr := chromedp.Run(ctx,
+            chromedp.Sleep(5*time.Second),
+            
+             chromedp.Evaluate(`Array.from(document.querySelectorAll('a.link-placeholder-class')).map(el => (el.innerText||el.textContent).trim())`, &names),
+            chromedp.Evaluate(`Array.from(document.querySelectorAll('td[data-label="Цена, тенге"]')).map(el => (el.innerText||el.textContent).trim())`, &prices),
+            chromedp.Evaluate(`Array.from(document.querySelectorAll('img.thumbnail')).map(el => el.src)`, &images),
+        )
+        if evalErr != nil {
+            log.Printf("❌ Evaluate error on page %d: %v", page, evalErr)
+            // if evaluate failed completely, break — could be selector change
+            break
+        }
+
+        log.Printf("found names=%d prices=%d images=%d", len(names), len(prices), len(images))
+        if len(names) == 0 {
+            log.Printf("No products found on page %d — stopping", page)
+            break
+        }
+
+        // build products slice
+        for i := 0; i < len(names) && i < len(prices); i++ {
+            p := models.Product{
+                Name:     strings.TrimSpace(names[i+1]),
+                Price:    parsePrice(prices[i]),
+                MinPrice: parsePrice(prices[i]),
+                MaxPrice: parsePrice(prices[i]),
+                Image: images[i],
+            }
+            products = append(products, p)
+        }
+
+        // check next page existence
+        var hasNext bool
+        if err := chromedp.Run(ctx,
+            chromedp.Evaluate(`document.querySelector('.pagination .next, .page-next, [aria-label="Next"]') !== null`, &hasNext),
+        ); err != nil {
+            log.Printf("Next page check error: %v", err)
+            break
+        }
+        if !hasNext {
+            log.Printf("No next page, finished")
+            break
+        }
+
+        // click next
+        if err := chromedp.Run(ctx,
+            chromedp.Click(`.pagination .next, .page-next, [aria-label="Next"]`, chromedp.ByQuery),
+            chromedp.Sleep(2*time.Second),
+        ); err != nil {
+            log.Printf("Failed to click next on page %d: %v", page, err)
+            break
+        }
+    }
+
+    log.Printf("✅ Scraped %d products from Kaspi", len(products))
+    return products, nil
+}
+
+
+
+func GetLowestCompetitorPrice(productName string) (float64, error){
+    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Create chromedp context with options
+	opts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.Flag("headless", true),
+		chromedp.Flag("disable-gpu", true),
+		chromedp.Flag("disable-dev-shm-usage", true),
+		chromedp.Flag("no-sandbox", true),
+		chromedp.Flag("disable-web-security", true),
+		chromedp.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"),
+	)
+
+	allocCtx, cancel := chromedp.NewExecAllocator(ctx, opts...)
+	defer cancel()
+
+	ctx, cancel = chromedp.NewContext(allocCtx, chromedp.WithLogf(log.Printf))
+	defer cancel()
+
+	// Encode product name for URL
+	searchURL := "https://kaspi.kz/shop/search/?text=" + url.QueryEscape(productName)
+    
+
+	fmt.Printf("Searching for: %s\n", productName)
+	fmt.Printf("URL: %s\n", searchURL)
+
+	var priceText string
+	var nodes []*cdp.Node
+
+	// Run chromedp tasks
+	err := chromedp.Run(ctx,
+		// Navigate to search page
+		chromedp.Navigate(searchURL),
+		
+		// Wait for page to load
+		chromedp.WaitVisible(`body`, chromedp.ByQuery),
+		
+		// Wait a bit for dynamic content to load
+		chromedp.Sleep(3*time.Second),
+		
+		// Find all product cards
+		chromedp.Nodes(`div.item-card.ddl_product.ddl_product_link`, &nodes, chromedp.ByQueryAll),
+	)
+
+	if err != nil {
+		return 0, fmt.Errorf("failed to load page: %v", err)
+	}
+
+	if len(nodes) == 0 {
+		return 0, fmt.Errorf("no products found")
+	}
+
+	// Try to get price from the first product
+	err = chromedp.Run(ctx,
+		// Look for price in the first product card
+		chromedp.Text(`div.item-card.ddl_product.ddl_product_link:first-child span.item-card__prices-price`, &priceText, chromedp.ByQuery),
+	)
+
+	if err != nil {
+		// If first selector doesn't work, try alternative selectors
+		err = chromedp.Run(ctx,
+			chromedp.Text(`.item-card__prices-price`, &priceText, chromedp.ByQuery),
+		)
+		
+		if err != nil {
+			return 0, fmt.Errorf("price element not found: %v", err)
+		}
+	}
+
+	fmt.Printf("Found price text: %s\n", priceText)
+
+	// Parse price from text
+	price := parsePrice(priceText)
+    return price, nil
+}
+
+func parsePrice(s string) float64 {
+    // Clean price string
+    s = strings.ReplaceAll(s, "\u00a0", "") // non-breaking space
+    s = strings.ReplaceAll(s, " ", "")
+    s = strings.ReplaceAll(s, "₸", "")
+    s = strings.ReplaceAll(s, "тг", "")
+    s = strings.ReplaceAll(s, ",", "")
+    s = strings.TrimSpace(s)
+    
+    price, err := strconv.ParseFloat(s, 64)
+    if err != nil {
+        return 0
+    }
+    
+    return price
+}
+
+// services/damping.go 
+package services
+
+import (
+    "kaspi-bot/db"
+    "kaspi-bot/models"
+    "kaspi-bot/scraper"
+    "kaspi-bot/kaspi"
+    "fmt"
+    "log"
+    "sync"
+    "time"
+)
+
+// Per-user damping state
+var (
+    dampingMutex    sync.RWMutex
+    userDampingState = make(map[string]*UserDampingState)
+)
+
+type UserDampingState struct {
+    IsRunning      bool
+    LastRun        time.Time
+    DampingResults []DampingResult
+}
+
+type DampingResult struct {
+    ProductName     string    `json:"product_name"`
+    OldPrice        float64   `json:"old_price"`
+    NewPrice        float64   `json:"new_price"`
+    CompetitorPrice float64   `json:"competitor_price"`
+    Success         bool      `json:"success"`
+    Error           string    `json:"error,omitempty"`
+    UpdatedAt       time.Time `json:"updated_at"`
+}
+
+func getUserDampingState(userID string) *UserDampingState {
+    dampingMutex.Lock()
+    defer dampingMutex.Unlock()
+    
+    if _, exists := userDampingState[userID]; !exists {
+        userDampingState[userID] = &UserDampingState{
+            IsRunning:      false,
+            DampingResults: []DampingResult{},
+        }
+    }
+    return userDampingState[userID]
+}
+
+func StartDamping(userID string) error {
+    state := getUserDampingState(userID)
+    
+    dampingMutex.Lock()
+    defer dampingMutex.Unlock()
+    
+    if state.IsRunning {
+        return fmt.Errorf("damping is already running for this user")
+    }
+    
+    go runDampingProcess(userID)
+    return nil
+}
+
+func runDampingProcess(userID string) {
+    state := getUserDampingState(userID)
+    
+    dampingMutex.Lock()
+    state.IsRunning = true
+    state.DampingResults = []DampingResult{} // Clear previous results
+    dampingMutex.Unlock()
+    
+    defer func() {
+        dampingMutex.Lock()
+        state.IsRunning = false
+        state.LastRun = time.Now()
+        dampingMutex.Unlock()
+    }()
+    
+    log.Printf("🎯 Starting comprehensive price damping process for user: %s", userID)
+    
+    // Get shop credentials for this user
+    shop, err := db.GetLatestShop(userID)
+    if err != nil {
+        log.Printf("❌ Failed to get shop credentials for user %s: %v", userID, err)
+        return
+    }
+    
+    // Get all products for this user
+    products, err := db.GetAllProducts(userID)
+    if err != nil {
+        log.Printf("❌ Failed to get products for user %s: %v", userID, err)
+        return
+    }
+    
+    log.Printf("📦 Processing %d products for damping (user: %s)", len(products), userID)
+    
+    successCount := 0
+    
+    for i, product := range products {
+        log.Printf("🔍 [%d/%d] Processing: %s (user: %s)", i+1, len(products), product.Name, userID)
+        
+        result := DampingResult{
+            ProductName: product.Name,
+            OldPrice:    product.Price,
+            UpdatedAt:   time.Now(),
+        }
+        
+        // Step 1: Get competitor price
+        log.Printf("   📊 Getting competitor prices...")
+        competitorPrice, err := scraper.GetLowestCompetitorPrice(product.Name)
+        if err != nil {
+            log.Printf("   ⚠️ Failed to get competitor price: %v", err)
+            result.Error = fmt.Sprintf("Failed to get competitor price: %v", err)
+            result.Success = false
+            addDampingResult(userID, result)
+            continue
+        }
+        
+        result.CompetitorPrice = competitorPrice
+        log.Printf("   💰 Competitor lowest price: %.0f KZT", competitorPrice)
+        
+        // Step 2: Calculate optimal price
+        var newPrice float64
+        if competitorPrice <= product.MinPrice {
+            newPrice = product.MinPrice
+            log.Printf("   ⬆️ Competitor price too low, using min price: %.0f KZT", newPrice)
+        } else {
+            newPrice = competitorPrice - 1
+            log.Printf("   🎯 Setting price 1 KZT below competitor: %.0f KZT", newPrice)
+        }
+        
+        // Apply max price constraint
+        if newPrice > product.MaxPrice {
+            newPrice = product.MaxPrice
+            log.Printf("   ⬇️ Adjusted to max price: %.0f KZT", newPrice)
+        }
+        
+        result.NewPrice = newPrice
+        
+        // Step 3: Check if price change is needed
+        if product.Price == newPrice {
+            log.Printf("   ⏭️ Price unchanged (%.0f KZT), skipping update", newPrice)
+            result.Success = true
+            result.Error = "No price change needed"
+            addDampingResult(userID, result)
+            continue
+        }
+        
+        // Step 4: Check if price change is significant enough
+        priceDifference := abs(product.Price - newPrice)
+        if priceDifference < 5 { // Less than 5 KZT difference
+            log.Printf("   ⏭️ Price difference too small (%.0f KZT), skipping update", priceDifference)
+            result.Success = true
+            result.Error = "Price difference too small, no update needed"
+            addDampingResult(userID, result)
+            continue
+        }
+        
+        log.Printf("   🎯 Updating price: %.0f → %.0f KZT (difference: %.0f)", product.Price, newPrice, priceDifference)
+        
+        // Step 5: Update price on Kaspi website
+        log.Printf("   🌐 Updating price on Kaspi website...")
+        err = kaspi.UpdateProductPriceOnKaspi(shop.Login, shop.Password, product.Name, newPrice)
+        if err != nil {
+            log.Printf("   ❌ Failed to update price on Kaspi: %v", err)
+            result.Error = fmt.Sprintf("Failed to update on Kaspi: %v", err)
+            result.Success = false
+            addDampingResult(userID, result)
+            continue
+        }
+        
+        // Step 6: Update price in local database (with user_id filtering)
+        log.Printf("   💾 Updating price in database...")
+        err = db.UpdateProductPrice(product.ID, newPrice, userID)
+        if err != nil {
+            log.Printf("   ⚠️ Failed to update price in database: %v", err)
+            result.Error = fmt.Sprintf("Updated on Kaspi but failed to save in DB: %v", err)
+            result.Success = false
+            addDampingResult(userID, result)
+            continue
+        }
+        
+        result.Success = true
+        successCount++
+        
+        log.Printf("   ✅ Successfully updated %s: %.0f → %.0f KZT", product.Name, product.Price, newPrice)
+        
+        addDampingResult(userID, result)
+        
+        // Small delay to avoid overwhelming servers
+        time.Sleep(3 * time.Second)
+    }
+    
+    log.Printf("🎉 Damping completed for user %s! Successfully updated %d out of %d products", userID, successCount, len(products))
+    
+    // Log summary
+    state = getUserDampingState(userID)
+    if len(state.DampingResults) > 0 {
+        log.Printf("📊 Damping Summary for user %s:", userID)
+        for _, result := range state.DampingResults {
+            status := "✅"
+            if !result.Success {
+                status = "❌"
+            }
+            log.Printf("   %s %s: %.0f → %.0f KZT", status, result.ProductName, result.OldPrice, result.NewPrice)
+        }
+    }
+}
+
+func addDampingResult(userID string, result DampingResult) {
+    dampingMutex.Lock()
+    defer dampingMutex.Unlock()
+    
+    state := userDampingState[userID]
+    if state != nil {
+        state.DampingResults = append(state.DampingResults, result)
+    }
+}
+
+func GetDampingStatus(userID string) models.DampingStatus {
+    state := getUserDampingState(userID)
+    products, _ := db.GetAllProducts(userID)
+    
+    dampingMutex.RLock()
+    defer dampingMutex.RUnlock()
+    
+    status := models.DampingStatus{
+        IsRunning:     state.IsRunning,
+        ProductsCount: len(products),
+    }
+    
+    if !state.LastRun.IsZero() {
+        status.LastRun = state.LastRun.Format("2006-01-02 15:04:05")
+    }
+    
+    if state.IsRunning {
+        status.Message = fmt.Sprintf("Damping in progress... Processed %d products", len(state.DampingResults))
+    } else if len(state.DampingResults) > 0 {
+        successCount := 0
+        for _, result := range state.DampingResults {
+            if result.Success {
+                successCount++
+            }
+        }
+        status.Message = fmt.Sprintf("Last run completed: %d/%d products updated successfully", successCount, len(state.DampingResults))
+    } else {
+        status.Message = "Damping process is idle"
+    }
+    
+    return status
+}
+
+func GetDampingResults(userID string) []DampingResult {
+    state := getUserDampingState(userID)
+    
+    dampingMutex.RLock()
+    defer dampingMutex.RUnlock()
+    
+    return state.DampingResults
+}
+
+func abs(x float64) float64 {
+    if x < 0 {
+        return -x
+    }
+    return x
+}
